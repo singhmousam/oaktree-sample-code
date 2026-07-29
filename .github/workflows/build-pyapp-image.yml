@@ -13,9 +13,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build the Docker image
-      run: docker build Day4/python/api --file Day4/python/api/Dockerfile --tag oakcrdev.azurecr.io/python-app:$(date +%s) 
+    - name: CI Pipeline
+        uses: actions/checkout@v4
+
 
     - name: Log in to Azure Container Registry
         uses: azure/docker-login@v1
