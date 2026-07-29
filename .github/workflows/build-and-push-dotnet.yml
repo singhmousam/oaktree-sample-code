@@ -1,0 +1,33 @@
+name: build-and-push
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: oakcrdev.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and Push Docker image
+        run: |
+          # Set the build tag using timestamp
+          IMAGE_TAG="oakcrdev.azurecr.io/python-app:$(date +%s)"
+          
+          # Build passing the app folder as context to prevent directory errors
+          docker build -t $IMAGE_TAG Day4/python/api
+          
+          # Push the image to Azure Container Registry
+          docker push $IMAGE_TAG
