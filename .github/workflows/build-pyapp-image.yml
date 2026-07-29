@@ -23,7 +23,7 @@ jobs:
           login-server: oakcrdev.azurecr.io
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
-          docker login oakcrdev.azurecr.io -u ${{ secrets.ACR_USERNAME }} -p ${{ secrets.ACR_PASSWORD }}
+          # docker login oakcrdev.azurecr.io -u ${{ secrets.ACR_USERNAME }} -p ${{ secrets.ACR_PASSWORD }}
 
     - name: Build and Push Docker image
         run: |
