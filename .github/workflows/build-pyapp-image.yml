@@ -1,8 +1,8 @@
-name: Docker Image CI
+name: build-image
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "deploy" ]
   pull_request:
     branches: [ "main" ]
 
