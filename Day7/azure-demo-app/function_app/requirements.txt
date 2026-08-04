@@ -1,0 +1,4 @@
+azure-functions
+azure-identity>=1.16.0
+azure-storage-file-share>=12.16.0
+azure-data-tables>=12.5.0

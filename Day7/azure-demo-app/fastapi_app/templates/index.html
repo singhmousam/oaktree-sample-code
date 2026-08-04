@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="refresh" content="30" />
+  <title>Uploaded Files</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; background: #f7f7f9; color: #1a1a1a; }
+    h1 { margin-bottom: 0.25rem; }
+    p.subtitle { color: #666; margin-top: 0; }
+    table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    th, td { padding: 0.6rem 1rem; text-align: left; border-bottom: 1px solid #eee; }
+    th { background: #2b2b3a; color: #fff; font-weight: 600; }
+    tr:hover { background: #f0f4ff; }
+    .empty, .error { padding: 1.5rem; background: #fff; border-radius: 6px; }
+    .error { color: #a12222; background: #fdecec; }
+  </style>
+</head>
+<body>
+  <h1>Uploaded Files</h1>
+  <p class="subtitle">Metadata collected by the Azure Function from the storage file share. Refreshes every 30s.</p>
+
+  {% if error %}
+    <div class="error">Could not load data from Cosmos DB: {{ error }}</div>
+  {% elif not files %}
+    <div class="empty">No files recorded yet. Upload something to the file share and wait for the next scan.</div>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>File name</th>
+        <th>Type</th>
+        <th>Size (bytes)</th>
+        <th>Last modified</th>
+        <th>Recorded at</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for f in files %}
+      <tr>
+        <td>{{ f.FileName }}</td>
+        <td>{{ f.FileType }}</td>
+        <td>{{ f.FileSizeBytes }}</td>
+        <td>{{ f.LastModified }}</td>
+        <td>{{ f.ProcessedAt }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</body>
+</html>
