@@ -4,7 +4,8 @@ A small end-to-end demo: drop a file into an Azure Files share, a Function
 picks up its metadata and writes it to Cosmos DB, and a FastAPI app shows it
 in a browser. Every service talks to the others using **managed identity** —
 there are no connection strings, SAS tokens, or account keys anywhere in the
-deployed configuration.
+deployed configuration. 
+Custom Message
 
 ## Architecture
 
