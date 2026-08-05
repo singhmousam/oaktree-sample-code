@@ -57,7 +57,7 @@ code to that if you want it instead.
 | Azure Container Registry (ACR) | Builds & hosts both app images |
 | 2x User-Assigned Managed Identity | One for the Function, one for the FastAPI app |
 | Storage Account + File Share | Where files are uploaded |
-| Key Vault | Holds the storage account key the FastAPI app uses for its own share access |
+| Key Vault | Holds the storage account key (file share access), JWT signing key, and hashed demo user list |
 | Cosmos DB (Table API) | Stores file metadata |
 | Function App (Elastic Premium, Linux, container) | Scans the share, writes metadata |
 | Container Apps environment + Container App | Hosts the FastAPI UI |
@@ -70,18 +70,79 @@ code to that if you want it instead.
   instead of waiting for the Function's next timer run.
 - **Upload from the browser** — a form that uploads a file straight to the
   file share and records its metadata right away.
+- **Delete a record** — admins only.
 
 Every record shows a `Source` column (`azure-function`, `fastapi-scan`, or
 `fastapi-upload`) so you can see which path produced it.
 
-**Auth model for these two features specifically:** the FastAPI app talks to
-Cosmos DB using its managed identity directly (OAuth), same as before. For
-the file share, it instead reads the storage account key out of **Key
-Vault** and uses that key — access to Key Vault itself is still via managed
-identity (`Key Vault Secrets User` role, read-only), so the only secret
-value anywhere in the whole stack is that one key, and only the FastAPI
-identity can read it. The Function App is unaffected — it still talks to the
-file share with pure OAuth (no key), as before.
+**Auth model for the file share vs. Cosmos:** the FastAPI app talks to
+Cosmos DB using its managed identity directly (OAuth). For the file share,
+it instead reads the storage account key out of **Key Vault** and uses that
+key — access to Key Vault itself is still via managed identity (`Key Vault
+Secrets User` role, read-only), so no key is ever hardcoded or passed
+around. The Function App is unaffected — it still talks to the file share
+with pure OAuth (no key), as before.
+
+## Authentication & Authorization
+
+The app has its own basic sign-in — no external identity provider (Auth0,
+Okta, Entra ID app registration, etc.), just a self-contained JWT flow:
+
+1. **Sign in** — `POST /auth/login` (browser form) verifies the username
+   and password, then sets the JWT in an HttpOnly cookie and redirects to
+   `/`. `POST /auth/token` does the same check but returns the JWT as JSON
+   instead — for `curl`/Postman/API use rather than a browser.
+2. **Every protected route validates the token** — `auth.get_current_user()`
+   reads the JWT from either the cookie or an `Authorization: Bearer <token>`
+   header, verifies its signature and expiry, and extracts the username and
+   role. Unauthenticated requests to the page redirect to `/login`;
+   unauthenticated API calls get a plain `401 Not authenticated`.
+3. **Roles gate specific actions**, using a simple hierarchy where each role
+   includes everything below it:
+
+   | Role | Can do |
+   |---|---|
+   | `reader` | View the recorded files table |
+   | `writer` | Everything `reader` can, plus upload files and trigger a scan |
+   | `admin` | Everything `writer` can, plus delete a file's record |
+
+   A request past its role (e.g. a `reader` calling `POST /scan`) gets
+   `403 Forbidden`, naming the role actually required.
+
+**Where the secrets live:** both the JWT signing key and the user list
+(with PBKDF2-hashed passwords, never plaintext) are Key Vault secrets,
+generated once at deploy time by `create_keyvault()` in `deploy.sh` and
+`scripts/generate_users_secret.py`. Only the FastAPI managed identity can
+read them (same `Key Vault Secrets User` role as the storage key above).
+
+**Demo accounts** are defined in `config.env`'s `DEMO_USERS` (one line per
+user, `username:password:role`) and printed (usernames + roles, not
+passwords) at the end of `./deploy.sh`. Edit that list before you deploy to
+set your own accounts.
+
+Try it:
+
+```bash
+# Get a token
+curl -X POST https://<app-url>/auth/token \
+  -d "username=writer1&password=<password-from-config.env>"
+
+# Use it
+curl https://<app-url>/api/files -H "Authorization: Bearer <token-from-above>"
+
+# Confirm who you are
+curl https://<app-url>/me -H "Authorization: Bearer <token-from-above>"
+```
+
+**This is a demo pattern, not a production auth system.** It deliberately
+keeps things minimal to show the mechanics (issue a JWT, validate it,
+authorize by role) end to end. Before using anything like this for real,
+you'd want at least: rate limiting / account lockout on login attempts,
+refresh tokens and a revocation list (a leaked JWT is valid until it
+expires — there's no way to invalidate one early here), secret rotation for
+the JWT signing key, a real user-management story instead of a static list,
+and probably MFA. For anything beyond a training demo, an actual identity
+provider (Entra ID, etc.) is the better call.
 
 ## Prerequisites
 
@@ -109,8 +170,9 @@ of creating duplicates.
 The script takes roughly 10–15 minutes, mostly waiting on the Cosmos DB
 account and the Elastic Premium plan to provision.
 
-At the end it prints the FastAPI app's public URL. From there you can just
-open the app and use the "Upload to file share" form or the "Scan file
+At the end it prints the FastAPI app's public URL along with the demo
+accounts (usernames and roles). Open the app, sign in as a `writer` or
+`admin` account, and use the "Upload to file share" form or the "Scan file
 share now" button directly in the browser — no CLI needed.
 
 If you'd rather upload via CLI and let the Function's timer pick it up:
@@ -137,7 +199,11 @@ local state file.
 ## Helper scripts
 
 Two standalone scripts under `scripts/` are useful for testing and as a
-fallback if the Azure Function gives you trouble:
+fallback if the Azure Function gives you trouble. Note that both talk to
+Azure directly with your own `az login` identity — they don't go through
+the FastAPI app, so the JWT sign-in described above doesn't apply to them
+(that's app-level authorization on top of, not instead of, Azure's own
+RBAC).
 
 ### `scripts/upload_to_fileshare.sh`
 Uploads whatever's in a local directory (default `./data`) into the Azure
@@ -199,12 +265,15 @@ charges.
 ## Project layout
 
 ```
-config.env                          deployment parameters
+config.env                          deployment parameters (incl. demo user list)
 deploy.sh                           deploy / destroy script
 function_app/                       Azure Function (timer trigger, Python v2 model)
-fastapi_app/                        FastAPI UI (Jinja2 template) + scan/upload endpoints
+fastapi_app/                        FastAPI UI (Jinja2 templates) + scan/upload/delete endpoints
 fastapi_app/clients.py              shared Key Vault / file share / Cosmos client helpers
+fastapi_app/auth.py                 JWT auth + reader/writer/admin authorization
+fastapi_app/templates/login.html    sign-in page
 scripts/upload_to_fileshare.sh      upload local files to the file share
 scripts/simulate_local_ingestion.py fallback: writes metadata to Cosmos DB without the Function
-data/                               local scratch folder used by both scripts above
+scripts/generate_users_secret.py    hashes DEMO_USERS for the Key Vault 'app-users' secret
+data/                               local scratch folder used by the scripts above
 ```

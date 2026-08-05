@@ -6,19 +6,23 @@
 #   Storage Account + File Share  -> uploads land here
 #   Azure Function (container, timer trigger) -> scans the share, writes
 #                                                 metadata to Cosmos DB
-#   Key Vault                     -> holds the storage account key that the
-#                                     FastAPI app uses for its own file-share
-#                                     scan/upload features
+#   Key Vault                     -> holds the storage account key the
+#                                     FastAPI app uses for file-share access,
+#                                     plus a JWT signing key and a hashed
+#                                     demo user list for the app's own
+#                                     login / role-based access control
 #   Cosmos DB (Table API)         -> stores file metadata
-#   FastAPI app (Container Apps)  -> reads Cosmos, shows an HTML table, can
-#                                     scan the share on demand and accept
-#                                     uploads through the browser
+#   FastAPI app (Container Apps)  -> JWT-protected: reads Cosmos, shows an
+#                                     HTML table, can scan the share on
+#                                     demand, accept uploads through the
+#                                     browser, and (admins only) delete a
+#                                     record — reader/writer/admin roles
 #   ACR                           -> builds/hosts both container images
 #   2x User-Assigned Managed Identity -> all service-to-service auth is via
-#                                         managed identity (incl. reading the
-#                                         Key Vault secret) — the only secret
-#                                         value in the whole stack is the one
-#                                         stored in Key Vault
+#                                         managed identity (incl. reading
+#                                         Key Vault secrets) — the only
+#                                         secret values in the whole stack
+#                                         are the ones stored in Key Vault
 #
 # Usage:
 #   ./deploy.sh                 # deploy everything
@@ -198,7 +202,8 @@ create_cosmos() {
 
 ###############################################################################
 # 5b. Key Vault — stores the storage account key that the FastAPI app's
-#     scan/upload features use to talk to the file share.
+#     scan/upload features use to talk to the file share, plus the JWT
+#     signing key and the hashed demo user list for the app's own login.
 ###############################################################################
 create_keyvault() {
   log "Creating Key Vault ${KV_NAME}"
@@ -210,7 +215,7 @@ create_keyvault() {
   KV_URI="$(az keyvault show -g "$RG_NAME" -n "$KV_NAME" --query properties.vaultUri -o tsv)"
 
   # RBAC-mode vaults deny everyone (including the creator) by default, so the
-  # deploying user needs a role here just to write the secret below.
+  # deploying user needs a role here just to write the secrets below.
   DEPLOYER_OBJECT_ID="$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)"
   if [[ -z "$DEPLOYER_OBJECT_ID" ]]; then
     echo "  Could not resolve your user object id (are you signed in as a service principal?)."
@@ -226,6 +231,14 @@ create_keyvault() {
   log "Storing the storage account key as a Key Vault secret"
   STORAGE_KEY="$(az storage account keys list -g "$RG_NAME" --account-name "$STORAGE_NAME" --query "[0].value" -o tsv)"
   az keyvault secret set --vault-name "$KV_NAME" --name "$STORAGE_KEY_SECRET_NAME" --value "$STORAGE_KEY" -o none
+
+  log "Generating a JWT signing key and storing it in Key Vault"
+  JWT_SECRET_VALUE="$(python3 -c "import secrets; print(secrets.token_hex(32))")"
+  az keyvault secret set --vault-name "$KV_NAME" --name "$JWT_SECRET_NAME" --value "$JWT_SECRET_VALUE" -o none
+
+  log "Hashing demo user passwords and storing them in Key Vault (plaintext never leaves this machine)"
+  USERS_JSON="$(printf '%s\n' "$DEMO_USERS" | python3 "${SCRIPT_DIR}/scripts/generate_users_secret.py")"
+  az keyvault secret set --vault-name "$KV_NAME" --name "$APP_USERS_SECRET_NAME" --value "$USERS_JSON" -o none
 
   ok "Key Vault ready: ${KV_URI}"
 }
@@ -361,6 +374,9 @@ deploy_fastapi() {
       "STORAGE_KEY_SECRET_NAME=${STORAGE_KEY_SECRET_NAME}" \
       "STORAGE_ACCOUNT_NAME=${STORAGE_NAME}" \
       "FILE_SHARE_NAME=${FILE_SHARE_NAME}" \
+      "JWT_SECRET_NAME=${JWT_SECRET_NAME}" \
+      "APP_USERS_SECRET_NAME=${APP_USERS_SECRET_NAME}" \
+      "ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES}" \
     -o none
 
   APP_URL="https://$(az containerapp show -g "$RG_NAME" -n "$CONTAINERAPP_NAME" --query properties.configuration.ingress.fqdn -o tsv)"
@@ -376,18 +392,26 @@ print_summary() {
 
   Resource group     : ${RG_NAME}
   Storage account     : ${STORAGE_NAME}  (file share: ${FILE_SHARE_NAME})
-  Key Vault           : ${KV_NAME}       (secret: ${STORAGE_KEY_SECRET_NAME})
+  Key Vault           : ${KV_NAME}       (secrets: ${STORAGE_KEY_SECRET_NAME}, ${JWT_SECRET_NAME}, ${APP_USERS_SECRET_NAME})
   Cosmos DB account   : ${COSMOS_NAME}   (table: ${COSMOS_TABLE_NAME})
   ACR                 : ${ACR_LOGIN_SERVER}
   Function App        : ${FUNCTION_APP_NAME}  (polls the file share every ${TIMER_SCHEDULE})
   FastAPI app         : ${APP_URL}
 
+  Demo accounts (passwords are whatever you set for each user in config.env's
+  DEMO_USERS — not repeated here since only their hashes were sent to Azure):
+$(printf '%s\n' "$DEMO_USERS" | awk -F: '{printf "    - %-10s role: %s\n", $1, $3}')
+
   Try it:
-    1. Open ${APP_URL} — upload a file directly in the browser, or use
-       'Scan file share now' to pick up files already sitting in the share.
-    2. Or upload via CLI and let the Function's timer catch it (up to ~2 min):
-       az storage file upload --account-name ${STORAGE_NAME} --share-name ${FILE_SHARE_NAME} \\
-         --source ./somefile.txt --auth-mode login
+    1. Open ${APP_URL} — you'll be redirected to sign in first.
+    2. Sign in as a 'writer' or 'admin' account, then upload a file directly
+       in the browser, or use 'Scan file share now' to pick up files already
+       sitting in the share. 'admin' accounts can also delete a record.
+    3. To test the API directly:
+       curl -X POST ${APP_URL}/auth/token -d "username=writer1&password=<pw>" \\
+         -H "Content-Type: application/x-www-form-urlencoded"
+       # then call, e.g.:
+       curl ${APP_URL}/api/files -H "Authorization: Bearer <token>"
 
   To remove everything:
     ./deploy.sh --destroy
