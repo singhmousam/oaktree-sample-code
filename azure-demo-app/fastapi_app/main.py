@@ -50,7 +50,9 @@ def index(request: Request):
     except Exception as exc:  # noqa: BLE001 - surface any auth/config issue in the UI
         error = str(exc)
     return templates.TemplateResponse(
-        name = "index.html", context = {"request": request, "files": files, "error": error}
+        request=request,
+        name="index.html",
+        context={"files": files, "error": error}
     )
 
 

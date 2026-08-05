@@ -115,6 +115,60 @@ Wait for the next timer run (up to ~2 minutes), then refresh the app URL.
 
 Deletes the whole resource group (background operation) and clears the
 local state file.
+## Helper scripts
+
+Two standalone scripts under `scripts/` are useful for testing and as a
+fallback if the Azure Function gives you trouble:
+
+### `scripts/upload_to_fileshare.sh`
+Uploads whatever's in a local directory (default `./data`) into the Azure
+File Share, so you don't have to use the Portal or Storage Explorer:
+
+```bash
+./scripts/upload_to_fileshare.sh              # uploads ./data using your az login
+./scripts/upload_to_fileshare.sh -d ./myfiles # a different source directory
+./scripts/upload_to_fileshare.sh -k           # fall back to the account key if
+                                               # your own login lacks a data role
+```
+
+### `scripts/simulate_local_ingestion.py`
+If the Function App isn't deploying or running correctly, this script does
+its job by hand: it scans a local directory (default `./data`), computes the
+same metadata (name, size, type, modified time), and writes it straight to
+Cosmos DB — no Function required. Records it writes are tagged
+`Source=local-simulator` so you can tell them apart from real Function runs
+(tagged `Source=azure-function`) in the FastAPI UI.
+
+```bash
+pip install -r scripts/requirements.txt
+
+python3 scripts/simulate_local_ingestion.py \
+  --cosmos-endpoint https://<cosmos-account>.table.cosmos.azure.com:443/ \
+  --cosmos-table filemetadata
+
+# preview without writing anything:
+python3 scripts/simulate_local_ingestion.py --dry-run
+```
+
+Both scripts use your own `az login` identity, not the deployed managed
+identities. `deploy.sh` only grants Cosmos/Storage data roles to the
+Function and FastAPI managed identities — if you get a permission error
+running these scripts yourself, grant your own account the same roles once:
+
+```bash
+# Cosmos DB (lets you write metadata manually)
+az cosmosdb sql role assignment create \
+  --resource-group <rg> --account-name <cosmos-account-name> \
+  --role-definition-id 00000000-0000-0000-0000-000000000002 \
+  --principal-id "$(az ad signed-in-user show --query id -o tsv)" \
+  --scope "$(az cosmosdb show -g <rg> -n <cosmos-account-name> --query id -o tsv)"
+
+# Storage File Share (lets you upload via --auth-mode login instead of -k)
+az role assignment create \
+  --assignee "$(az ad signed-in-user show --query id -o tsv)" \
+  --role "Storage File Data Privileged Contributor" \
+  --scope "$(az storage account show -n <storage-account-name> --query id -o tsv)"
+```
 
 ## Cost note
 
