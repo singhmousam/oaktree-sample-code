@@ -115,6 +115,7 @@ def scan_file_share(timer: func.TimerRequest) -> None:
             "FileType": content_type,
             "LastModified": last_modified_iso,
             "ProcessedAt": datetime.now(timezone.utc).isoformat(),
+            "Source": "azure-function",
         }
         table_client.upsert_entity(entity)
         new_or_updated += 1

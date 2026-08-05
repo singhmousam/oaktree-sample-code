@@ -6,11 +6,19 @@
 #   Storage Account + File Share  -> uploads land here
 #   Azure Function (container, timer trigger) -> scans the share, writes
 #                                                 metadata to Cosmos DB
+#   Key Vault                     -> holds the storage account key that the
+#                                     FastAPI app uses for its own file-share
+#                                     scan/upload features
 #   Cosmos DB (Table API)         -> stores file metadata
-#   FastAPI app (Container Apps)  -> reads Cosmos, shows an HTML table
+#   FastAPI app (Container Apps)  -> reads Cosmos, shows an HTML table, can
+#                                     scan the share on demand and accept
+#                                     uploads through the browser
 #   ACR                           -> builds/hosts both container images
-#   2x User-Assigned Managed Identity -> all service-to-service auth,
-#                                         no connection strings / keys used
+#   2x User-Assigned Managed Identity -> all service-to-service auth is via
+#                                         managed identity (incl. reading the
+#                                         Key Vault secret) — the only secret
+#                                         value in the whole stack is the one
+#                                         stored in Key Vault
 #
 # Usage:
 #   ./deploy.sh                 # deploy everything
@@ -24,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
 STATE_FILE="${SCRIPT_DIR}/.deploy_state"
 DESTROY=false
-SUFFIX='dev'
+
 ###############################################################################
 # Argument parsing
 ###############################################################################
@@ -42,29 +50,27 @@ done
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
-echo "Read the config file"
-echo "Initializing the deployment process"
+
 ###############################################################################
 # Derive resource names. A random suffix is generated once and persisted in
 # .deploy_state so that re-running deploy.sh (or destroy) is idempotent and
 # always targets the same set of resources.
 ###############################################################################
-# if [[ -f "$STATE_FILE" ]]; then
-#   # shellcheck source=/dev/null
-#   source "$STATE_FILE"
-# else
-#   # SUFFIX="$(tr -dc 'a-z0-9' </dev/urandom | head -c 3)"
-#   SUFFIX="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 3)"
-#   echo "SUFFIX=${SUFFIX}" > "$STATE_FILE"
-# fi
+if [[ -f "$STATE_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$STATE_FILE"
+else
+  SUFFIX="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
+  echo "SUFFIX=${SUFFIX}" > "$STATE_FILE"
+fi
 
-# SUFFIX="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 3)"
-echo "SUFFIX=${SUFFIX}" > "$STATE_FILE"
-echo "Setting resource names"
 RG_NAME="rg-${PREFIX}-${SUFFIX}"
 ACR_NAME="acr${PREFIX}${SUFFIX}"                                   # alnum only
 STORAGE_NAME="$(echo "st${PREFIX}${SUFFIX}" | cut -c1-24)"         # <=24 chars, alnum
 COSMOS_NAME="cosmos-${PREFIX}-${SUFFIX}"
+KV_NAME="$(echo "kv-${PREFIX}-${SUFFIX}" | cut -c1-24)"
+KV_NAME="${KV_NAME%-}"                                              # no trailing hyphen
+STORAGE_KEY_SECRET_NAME="storage-account-key"
 ID_FUNC_NAME="id-func-${PREFIX}-${SUFFIX}"
 ID_API_NAME="id-api-${PREFIX}-${SUFFIX}"
 PLAN_NAME="plan-func-${PREFIX}-${SUFFIX}"
@@ -80,7 +86,6 @@ API_IMAGE_TAG="latest"
 log()  { echo -e "\n\033[1;34m==>\033[0m $*"; }
 ok()   { echo -e "\033[1;32m✓\033[0m $*"; }
 
-echo "Checking Prerequisities"
 ###############################################################################
 # Helpers
 ###############################################################################
@@ -101,6 +106,11 @@ destroy_all() {
   if az group show -n "$RG_NAME" >/dev/null 2>&1; then
     az group delete -n "$RG_NAME" --yes --no-wait
     ok "Delete requested (running in background). Check with: az group show -n ${RG_NAME}"
+    echo "  Note: Key Vault has soft-delete enabled by default, so '${KV_NAME:-<vault>}'"
+    echo "  will remain in a recoverable, soft-deleted state for a retention period"
+    echo "  after the group finishes deleting. This doesn't block re-running deploy.sh"
+    echo "  (a fresh random suffix is used), but if you want to fully purge it:"
+    echo "    az keyvault purge --name <vault-name> --location ${LOCATION}"
   else
     echo "Resource group ${RG_NAME} does not exist — nothing to delete."
   fi
@@ -109,7 +119,6 @@ destroy_all() {
   exit 0
 }
 
-echo "Creating resources"
 ###############################################################################
 # 1. Resource group
 ###############################################################################
@@ -188,7 +197,43 @@ create_cosmos() {
 }
 
 ###############################################################################
-# 6. Role assignments (all access is managed-identity based — no keys)
+# 5b. Key Vault — stores the storage account key that the FastAPI app's
+#     scan/upload features use to talk to the file share.
+###############################################################################
+create_keyvault() {
+  log "Creating Key Vault ${KV_NAME}"
+  az keyvault create \
+    -g "$RG_NAME" -n "$KV_NAME" -l "$LOCATION" \
+    --enable-rbac-authorization true -o none
+
+  KV_ID="$(az keyvault show -g "$RG_NAME" -n "$KV_NAME" --query id -o tsv)"
+  KV_URI="$(az keyvault show -g "$RG_NAME" -n "$KV_NAME" --query properties.vaultUri -o tsv)"
+
+  # RBAC-mode vaults deny everyone (including the creator) by default, so the
+  # deploying user needs a role here just to write the secret below.
+  DEPLOYER_OBJECT_ID="$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)"
+  if [[ -z "$DEPLOYER_OBJECT_ID" ]]; then
+    echo "  Could not resolve your user object id (are you signed in as a service principal?)."
+    echo "  Grant yourself 'Key Vault Secrets Officer' on ${KV_NAME} manually, then re-run."
+    exit 1
+  fi
+  az role assignment create --assignee-object-id "$DEPLOYER_OBJECT_ID" --assignee-principal-type User \
+    --role "Key Vault Secrets Officer" --scope "$KV_ID" -o none
+
+  log "Waiting for RBAC role propagation (~20s)"
+  sleep 20
+
+  log "Storing the storage account key as a Key Vault secret"
+  STORAGE_KEY="$(az storage account keys list -g "$RG_NAME" --account-name "$STORAGE_NAME" --query "[0].value" -o tsv)"
+  az keyvault secret set --vault-name "$KV_NAME" --name "$STORAGE_KEY_SECRET_NAME" --value "$STORAGE_KEY" -o none
+
+  ok "Key Vault ready: ${KV_URI}"
+}
+
+###############################################################################
+# 6. Role assignments (all service-to-service access is managed-identity
+#    based; the storage account key held in Key Vault is the only secret
+#    value anywhere in the stack, and only the FastAPI identity may read it)
 ###############################################################################
 assign_roles() {
   log "Assigning RBAC roles to managed identities"
@@ -206,10 +251,16 @@ assign_roles() {
       --role "$role" --scope "$STORAGE_ID" -o none
   done
 
+  # --- Key Vault: only the FastAPI identity can read the storage key secret ---
+  az role assignment create --assignee-object-id "$ID_API_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal \
+    --role "Key Vault Secrets User" --scope "$KV_ID" -o none
+
   # --- Cosmos DB data-plane RBAC (works for the Table API too — it shares
-  #     the same account-level data-plane role system) ---
+  #     the same account-level data-plane role system). The API identity now
+  #     gets Contributor (not just Reader) because the FastAPI app's new
+  #     "scan now" and "upload" features write records directly, in addition
+  #     to the Function still writing on its own timer schedule. ---
   CONTRIBUTOR_ROLE_ID="00000000-0000-0000-0000-000000000002"   # built-in: Data Contributor
-  READER_ROLE_ID="00000000-0000-0000-0000-000000000001"        # built-in: Data Reader
 
   az cosmosdb sql role assignment create \
     -g "$RG_NAME" -a "$COSMOS_NAME" \
@@ -219,7 +270,7 @@ assign_roles() {
 
   az cosmosdb sql role assignment create \
     -g "$RG_NAME" -a "$COSMOS_NAME" \
-    --role-definition-id "$READER_ROLE_ID" \
+    --role-definition-id "$CONTRIBUTOR_ROLE_ID" \
     --principal-id "$ID_API_PRINCIPAL_ID" \
     --scope "$COSMOS_ID" -o none
 
@@ -306,6 +357,10 @@ deploy_fastapi() {
       "AZURE_CLIENT_ID=${ID_API_CLIENT_ID}" \
       "COSMOS_TABLE_ENDPOINT=${COSMOS_TABLE_ENDPOINT}" \
       "COSMOS_TABLE_NAME=${COSMOS_TABLE_NAME}" \
+      "KEY_VAULT_URL=${KV_URI}" \
+      "STORAGE_KEY_SECRET_NAME=${STORAGE_KEY_SECRET_NAME}" \
+      "STORAGE_ACCOUNT_NAME=${STORAGE_NAME}" \
+      "FILE_SHARE_NAME=${FILE_SHARE_NAME}" \
     -o none
 
   APP_URL="https://$(az containerapp show -g "$RG_NAME" -n "$CONTAINERAPP_NAME" --query properties.configuration.ingress.fqdn -o tsv)"
@@ -321,17 +376,18 @@ print_summary() {
 
   Resource group     : ${RG_NAME}
   Storage account     : ${STORAGE_NAME}  (file share: ${FILE_SHARE_NAME})
+  Key Vault           : ${KV_NAME}       (secret: ${STORAGE_KEY_SECRET_NAME})
   Cosmos DB account   : ${COSMOS_NAME}   (table: ${COSMOS_TABLE_NAME})
   ACR                 : ${ACR_LOGIN_SERVER}
   Function App        : ${FUNCTION_APP_NAME}  (polls the file share every ${TIMER_SCHEDULE})
   FastAPI app         : ${APP_URL}
 
   Try it:
-    1. Upload a file to the '${FILE_SHARE_NAME}' file share (Portal, Storage Explorer, or:
+    1. Open ${APP_URL} — upload a file directly in the browser, or use
+       'Scan file share now' to pick up files already sitting in the share.
+    2. Or upload via CLI and let the Function's timer catch it (up to ~2 min):
        az storage file upload --account-name ${STORAGE_NAME} --share-name ${FILE_SHARE_NAME} \\
-         --source ./somefile.txt --auth-mode login)
-    2. Wait for the next Function timer run (up to ~2 min).
-    3. Open ${APP_URL} to see the file listed.
+         --source ./somefile.txt --auth-mode login
 
   To remove everything:
     ./deploy.sh --destroy
@@ -352,8 +408,9 @@ create_acr
 create_identities
 create_storage
 create_cosmos
+create_keyvault
 assign_roles
 build_images
-# deploy_function
+deploy_function
 deploy_fastapi
 print_summary

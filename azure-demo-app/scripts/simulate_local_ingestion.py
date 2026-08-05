@@ -62,7 +62,7 @@ def parse_args():
     )
     parser.add_argument(
         "--cosmos-endpoint",
-        default=os.environ.get("COSMOS_TABLE_ENDPOINT", "value-not-set"),
+        default=os.environ.get("COSMOS_TABLE_ENDPOINT"),
         help="Cosmos DB Table endpoint, e.g. https://<account>.table.cosmos.azure.com:443/",
     )
     parser.add_argument(
@@ -134,13 +134,11 @@ def main():
             "  pip install azure-identity azure-data-tables"
         )
 
-    # credential = DefaultAzureCredential()
-    # table_client = TableServiceClient(
-    #     endpoint=cosmos_endpoint, credential=credential
-    # ).get_table_client(args.cosmos_table)
+    credential = DefaultAzureCredential()
+    table_client = TableServiceClient(
+        endpoint=args.cosmos_endpoint, credential=credential
+    ).get_table_client(args.cosmos_table)
 
-    table_client = TableServiceClient.from_connection_string(
-        conn_str=self.cosmos_endpoint).get_table_client(args.cosmos_table)
     for entity in entities:
         table_client.upsert_entity(entity)
         print(f"Wrote record for {entity['FileName']}")
