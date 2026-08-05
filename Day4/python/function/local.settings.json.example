@@ -1,9 +1,0 @@
-{
-  "IsEncrypted": false,
-  "Values": {
-    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-    "FUNCTIONS_WORKER_RUNTIME": "python",
-    "KEY_VAULT_URL": "https://kv-oaktree-dev.vault.azure.net/",
-    "APPLICATIONINSIGHTS_CONNECTION_STRING": ""
-  }
-}
