@@ -232,13 +232,15 @@ create_keyvault() {
   STORAGE_KEY="$(az storage account keys list -g "$RG_NAME" --account-name "$STORAGE_NAME" --query "[0].value" -o tsv)"
   az keyvault secret set --vault-name "$KV_NAME" --name "$STORAGE_KEY_SECRET_NAME" --value "$STORAGE_KEY" -o none
 
-  log "Generating a JWT signing key and storing it in Key Vault"
-  JWT_SECRET_VALUE="$(python3 -c "import secrets; print(secrets.token_hex(32))")"
-  az keyvault secret set --vault-name "$KV_NAME" --name "$JWT_SECRET_NAME" --value "$JWT_SECRET_VALUE" -o none
+  if [[ "$AUTH_MODE" == "jwt" ]]; then
+    log "Generating a JWT signing key and storing it in Key Vault"
+    JWT_SECRET_VALUE="$(python3 -c "import secrets; print(secrets.token_hex(32))")"
+    az keyvault secret set --vault-name "$KV_NAME" --name "$JWT_SECRET_NAME" --value "$JWT_SECRET_VALUE" -o none
 
-  log "Hashing demo user passwords and storing them in Key Vault (plaintext never leaves this machine)"
-  USERS_JSON="$(printf '%s\n' "$DEMO_USERS" | python3 "${SCRIPT_DIR}/scripts/generate_users_secret.py")"
-  az keyvault secret set --vault-name "$KV_NAME" --name "$APP_USERS_SECRET_NAME" --value "$USERS_JSON" -o none
+    log "Hashing demo user passwords and storing them in Key Vault (plaintext never leaves this machine)"
+    USERS_JSON="$(printf '%s\n' "$DEMO_USERS" | python3 "${SCRIPT_DIR}/scripts/generate_users_secret.py")"
+    az keyvault secret set --vault-name "$KV_NAME" --name "$APP_USERS_SECRET_NAME" --value "$USERS_JSON" -o none
+  fi
 
   ok "Key Vault ready: ${KV_URI}"
 }
@@ -374,6 +376,7 @@ deploy_fastapi() {
       "STORAGE_KEY_SECRET_NAME=${STORAGE_KEY_SECRET_NAME}" \
       "STORAGE_ACCOUNT_NAME=${STORAGE_NAME}" \
       "FILE_SHARE_NAME=${FILE_SHARE_NAME}" \
+      "AUTH_MODE=${AUTH_MODE}" \
       "JWT_SECRET_NAME=${JWT_SECRET_NAME}" \
       "APP_USERS_SECRET_NAME=${APP_USERS_SECRET_NAME}" \
       "ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES}" \
@@ -384,38 +387,108 @@ deploy_fastapi() {
 }
 
 ###############################################################################
+# 9b. Configure Microsoft Entra ID authentication on the Container App
+#     (only when AUTH_MODE=azuread — see docs/azure-ad-setup.md). Runs
+#     scripts/setup_azure_ad.sh automatically the first time, since it needs
+#     the Container App's URL (now known) for the redirect URI. If you ran
+#     that script yourself ahead of time, its output is reused as-is.
+###############################################################################
+configure_azuread_auth() {
+  if [[ "$AUTH_MODE" != "azuread" ]]; then
+    return 0
+  fi
+
+  local state_file="${SCRIPT_DIR}/.azuread_state"
+  if [[ ! -f "$state_file" ]]; then
+    log "AUTH_MODE=azuread and no prior Azure AD setup found — running scripts/setup_azure_ad.sh"
+    echo "  (This step registers an app in Entra ID and needs directory permission"
+    echo "  to do so — separate from the Contributor role used for everything else"
+    echo "  in this script. See docs/azure-ad-setup.md if it fails here.)"
+    "${SCRIPT_DIR}/scripts/setup_azure_ad.sh" \
+      --redirect-uri "${APP_URL}/.auth/login/aad/callback" \
+      --display-name "${AAD_APP_DISPLAY_NAME}-${SUFFIX}"
+  fi
+
+  # shellcheck source=/dev/null
+  source "$state_file"   # provides AAD_APP_ID, AAD_TENANT_ID, AAD_CLIENT_SECRET
+
+  log "Storing the Azure AD client secret in Key Vault"
+  az keyvault secret set --vault-name "$KV_NAME" --name "aad-client-secret" --value "$AAD_CLIENT_SECRET" -o none
+
+  log "Referencing the Key Vault secret from the Container App (no secret in plain env vars)"
+  az containerapp secret set \
+    -n "$CONTAINERAPP_NAME" -g "$RG_NAME" \
+    --secrets "aad-client-secret=keyvaultref:${KV_URI}secrets/aad-client-secret,identityref:${ID_API_ID}" \
+    -o none
+
+  log "Enabling Microsoft Entra ID authentication on the Container App"
+  az containerapp auth microsoft update \
+    -g "$RG_NAME" -n "$CONTAINERAPP_NAME" \
+    --client-id "$AAD_APP_ID" \
+    --client-secret-name "aad-client-secret" \
+    --tenant-id "$AAD_TENANT_ID" \
+    --yes -o none
+
+  az containerapp auth update \
+    -g "$RG_NAME" -n "$CONTAINERAPP_NAME" \
+    --action RedirectToLoginPage \
+    --enabled true \
+    -o none
+
+  ok "Microsoft Entra ID authentication enabled on ${CONTAINERAPP_NAME}"
+}
+
+###############################################################################
 # 10. Summary
 ###############################################################################
 print_summary() {
   log "Deployment complete"
-  cat <<EOF
+  echo ""
+  echo "  Resource group     : ${RG_NAME}"
+  echo "  Storage account     : ${STORAGE_NAME}  (file share: ${FILE_SHARE_NAME})"
+  if [[ "$AUTH_MODE" == "jwt" ]]; then
+    echo "  Key Vault           : ${KV_NAME}       (secrets: ${STORAGE_KEY_SECRET_NAME}, ${JWT_SECRET_NAME}, ${APP_USERS_SECRET_NAME})"
+  else
+    echo "  Key Vault           : ${KV_NAME}       (secrets: ${STORAGE_KEY_SECRET_NAME}, aad-client-secret)"
+  fi
+  echo "  Cosmos DB account   : ${COSMOS_NAME}   (table: ${COSMOS_TABLE_NAME})"
+  echo "  ACR                 : ${ACR_LOGIN_SERVER}"
+  echo "  Function App        : ${FUNCTION_APP_NAME}  (polls the file share every ${TIMER_SCHEDULE})"
+  echo "  FastAPI app         : ${APP_URL}"
+  echo "  Auth mode           : ${AUTH_MODE}"
+  echo ""
 
-  Resource group     : ${RG_NAME}
-  Storage account     : ${STORAGE_NAME}  (file share: ${FILE_SHARE_NAME})
-  Key Vault           : ${KV_NAME}       (secrets: ${STORAGE_KEY_SECRET_NAME}, ${JWT_SECRET_NAME}, ${APP_USERS_SECRET_NAME})
-  Cosmos DB account   : ${COSMOS_NAME}   (table: ${COSMOS_TABLE_NAME})
-  ACR                 : ${ACR_LOGIN_SERVER}
-  Function App        : ${FUNCTION_APP_NAME}  (polls the file share every ${TIMER_SCHEDULE})
-  FastAPI app         : ${APP_URL}
+  if [[ "$AUTH_MODE" == "jwt" ]]; then
+    echo "  Demo accounts (passwords are whatever you set for each user in config.env's"
+    echo "  DEMO_USERS — not repeated here since only their hashes were sent to Azure):"
+    printf '%s\n' "$DEMO_USERS" | awk -F: '{printf "    - %-10s role: %s\n", $1, $3}'
+    echo ""
+    echo "  Try it:"
+    echo "    1. Open ${APP_URL} — you'll be redirected to sign in first."
+    echo "    2. Sign in as a 'writer' or 'admin' account, then upload a file directly"
+    echo "       in the browser, or use 'Scan file share now' to pick up files already"
+    echo "       sitting in the share. 'admin' accounts can also delete a record."
+    echo "    3. To test the API directly:"
+    echo "       curl -X POST ${APP_URL}/auth/token -d \"username=writer1&password=<pw>\" \\"
+    echo "         -H \"Content-Type: application/x-www-form-urlencoded\""
+    echo "       # then call, e.g.:"
+    echo "       curl ${APP_URL}/api/files -H \"Authorization: Bearer <token>\""
+  else
+    echo "  Entra ID app        : ${AAD_APP_ID:-<see .azuread_state>} (tenant ${AAD_TENANT_ID:-<see .azuread_state>})"
+    echo ""
+    echo "  Try it:"
+    echo "    1. Open ${APP_URL} — Entra ID will prompt you to sign in."
+    echo "    2. Only users assigned a Reader/Writer/Admin app role can get in."
+    echo "       Check/add assignments: Entra ID > Enterprise applications >"
+    echo "       '${AAD_APP_DISPLAY_NAME}-${SUFFIX}' > Users and groups."
+    echo "    3. For API testing, acquire a token for app ID ${AAD_APP_ID:-<app-id>} via"
+    echo "       MSAL/az CLI and call, e.g.: curl ${APP_URL}/api/files -H \"Authorization: Bearer <token>\""
+    echo "    See docs/azure-ad-setup.md for details."
+  fi
 
-  Demo accounts (passwords are whatever you set for each user in config.env's
-  DEMO_USERS — not repeated here since only their hashes were sent to Azure):
-$(printf '%s\n' "$DEMO_USERS" | awk -F: '{printf "    - %-10s role: %s\n", $1, $3}')
-
-  Try it:
-    1. Open ${APP_URL} — you'll be redirected to sign in first.
-    2. Sign in as a 'writer' or 'admin' account, then upload a file directly
-       in the browser, or use 'Scan file share now' to pick up files already
-       sitting in the share. 'admin' accounts can also delete a record.
-    3. To test the API directly:
-       curl -X POST ${APP_URL}/auth/token -d "username=writer1&password=<pw>" \\
-         -H "Content-Type: application/x-www-form-urlencoded"
-       # then call, e.g.:
-       curl ${APP_URL}/api/files -H "Authorization: Bearer <token>"
-
-  To remove everything:
-    ./deploy.sh --destroy
-EOF
+  echo ""
+  echo "  To remove everything:"
+  echo "    ./deploy.sh --destroy"
 }
 
 ###############################################################################
@@ -437,4 +510,5 @@ assign_roles
 build_images
 deploy_function
 deploy_fastapi
+configure_azuread_auth
 print_summary

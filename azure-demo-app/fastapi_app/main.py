@@ -10,10 +10,16 @@ FastAPI app.
   directly from the browser, and immediately records its metadata too.
 - Delete a record — admins only.
 
-Everything above is protected by a self-contained JWT auth layer (see
-auth.py): sign in via /login (browser, cookie-based) or /auth/token (API,
-returns JSON), then every route resolves the caller's identity and role
-(reader/writer/admin) from that token.
+Every route above is protected by role (reader/writer/admin), resolved via
+the auth facade (auth.py), which is backed by EITHER:
+  - AUTH_MODE=jwt      -> this app's own login/JWT issuance (auth_jwt.py), or
+  - AUTH_MODE=azuread  -> Microsoft Entra ID via Container Apps' built-in
+                           auth (auth_azuread.py) — see docs/azure-ad-setup.md.
+main.py itself doesn't change between modes; only the /login, /auth/login,
+and /auth/token routes below are specific to "jwt" mode and are skipped
+entirely when AUTH_MODE=azuread, since Entra ID sign-in/sign-out happens at
+the platform level (/.auth/login/aad, /.auth/logout) before a request ever
+reaches this container.
 
 Cosmos DB access uses the container's managed identity (OAuth) directly.
 File share access uses a storage account key that a managed identity reads
@@ -31,6 +37,9 @@ from clients import TRACKING_PARTITION_KEY, build_entity, get_share_client, get_
 
 app = FastAPI(title="Uploaded Files Demo")
 templates = Jinja2Templates(directory="templates")
+
+# Where the "sign out" link in the template should point, per auth mode.
+LOGOUT_URL = "/.auth/logout" if auth.AUTH_MODE == "azuread" else "/auth/logout"
 
 
 # --------------------------------------------------------------------------
@@ -68,60 +77,61 @@ def _scan_and_record(source: str = "fastapi-scan") -> int:
 
 
 # --------------------------------------------------------------------------
-# Auth routes
+# Auth routes (AUTH_MODE=jwt only — Entra ID mode handles sign-in/out at the
+# platform level via /.auth/login/aad and /.auth/logout, before requests
+# even reach this container)
 # --------------------------------------------------------------------------
-@app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request, error: str | None = None):
-    return templates.TemplateResponse(request, "login.html", {"error": error})
+if auth.AUTH_MODE == "jwt":
 
+    @app.get("/login", response_class=HTMLResponse)
+    def login_page(request: Request, error: str | None = None):
+        return templates.TemplateResponse(request, "login.html", {"error": error})
 
-@app.post("/auth/login")
-def login_submit(username: str = Form(...), password: str = Form(...)):
-    """Browser flow: verify credentials, set an HttpOnly cookie, redirect to /."""
-    user = auth.authenticate(username, password)
-    if not user:
-        return RedirectResponse(url="/login?error=Invalid+username+or+password", status_code=303)
+    @app.post("/auth/login")
+    def login_submit(username: str = Form(...), password: str = Form(...)):
+        """Browser flow: verify credentials, set an HttpOnly cookie, redirect to /."""
+        user = auth.authenticate(username, password)
+        if not user:
+            return RedirectResponse(url="/login?error=Invalid+username+or+password", status_code=303)
 
-    token = auth.create_access_token(username=user["username"], role=user["role"])
-    redirect = RedirectResponse(url="/", status_code=303)
-    redirect.set_cookie(
-        key="access_token",
-        value=token,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-        max_age=auth.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-    )
-    return redirect
+        token = auth.create_access_token(username=user["username"], role=user["role"])
+        redirect = RedirectResponse(url="/", status_code=303)
+        redirect.set_cookie(
+            key="access_token",
+            value=token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=auth.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        )
+        return redirect
 
-
-@app.post("/auth/token")
-def issue_token(username: str = Form(...), password: str = Form(...)):
-    """API flow: verify credentials, return the JWT as JSON (no cookie). For curl/Postman-style use:
+    @app.post("/auth/token")
+    def issue_token(username: str = Form(...), password: str = Form(...)):
+        """API flow: verify credentials, return the JWT as JSON (no cookie). For curl/Postman-style use:
 
         curl -X POST <app-url>/auth/token -d "username=writer1&password=<pw>"
         curl <app-url>/api/files -H "Authorization: Bearer <token>"
-    """
-    user = auth.authenticate(username, password)
-    if not user:
-        return HTMLResponse(status_code=401, content='{"detail":"Invalid username or password"}')
+        """
+        user = auth.authenticate(username, password)
+        if not user:
+            return HTMLResponse(status_code=401, content='{"detail":"Invalid username or password"}')
 
-    token = auth.create_access_token(username=user["username"], role=user["role"])
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "username": user["username"],
-        "role": user["role"],
-        "expires_in_minutes": auth.ACCESS_TOKEN_EXPIRE_MINUTES,
-    }
+        token = auth.create_access_token(username=user["username"], role=user["role"])
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "username": user["username"],
+            "role": user["role"],
+            "expires_in_minutes": auth.ACCESS_TOKEN_EXPIRE_MINUTES,
+        }
 
-
-@app.get("/auth/logout")
-@app.post("/auth/logout")
-def logout():
-    redirect = RedirectResponse(url="/login", status_code=303)
-    redirect.delete_cookie("access_token")
-    return redirect
+    @app.get("/auth/logout")
+    @app.post("/auth/logout")
+    def logout():
+        redirect = RedirectResponse(url="/login", status_code=303)
+        redirect.delete_cookie("access_token")
+        return redirect
 
 
 @app.get("/me")
@@ -136,7 +146,12 @@ def me(user: dict = Depends(auth.get_current_user)):
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, message: str | None = None, user: dict | None = Depends(auth.get_current_user_optional)):
     if user is None:
-        return RedirectResponse(url="/login")
+        # In "jwt" mode we own the login page. In "azuread" mode, Container
+        # Apps' built-in auth normally redirects unauthenticated browsers to
+        # Entra ID before the request ever reaches us — this branch is a
+        # defensive fallback in case that's somehow been bypassed.
+        login_url = "/login" if auth.AUTH_MODE == "jwt" else "/.auth/login/aad"
+        return RedirectResponse(url=login_url)
 
     error = None
     files = []
@@ -158,6 +173,7 @@ def index(request: Request, message: str | None = None, user: dict | None = Depe
             "user": user,
             "can_write": can_write,
             "can_admin": can_admin,
+            "logout_url": LOGOUT_URL,
         },
     )
 

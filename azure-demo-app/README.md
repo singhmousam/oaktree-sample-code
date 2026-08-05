@@ -85,29 +85,33 @@ with pure OAuth (no key), as before.
 
 ## Authentication & Authorization
 
+The app supports **two interchangeable auth mechanisms**, switched with one
+setting — `AUTH_MODE` in `config.env` — with no code changes required
+either way. Both enforce the same reader/writer/admin role hierarchy:
+
+| Role | Can do |
+|---|---|
+| `reader` | View the recorded files table |
+| `writer` | Everything `reader` can, plus upload files and trigger a scan |
+| `admin` | Everything `writer` can, plus delete a file's record |
+
+A request past its role (e.g. a `reader` calling `POST /scan`) gets `403
+Forbidden`, naming the role actually required.
+
+### `AUTH_MODE=jwt` (default) — self-contained, no external IdP
+
 The app has its own basic sign-in — no external identity provider (Auth0,
-Okta, Entra ID app registration, etc.), just a self-contained JWT flow:
+Okta, Entra ID, etc.), just a self-contained JWT flow:
 
 1. **Sign in** — `POST /auth/login` (browser form) verifies the username
    and password, then sets the JWT in an HttpOnly cookie and redirects to
    `/`. `POST /auth/token` does the same check but returns the JWT as JSON
    instead — for `curl`/Postman/API use rather than a browser.
-2. **Every protected route validates the token** — `auth.get_current_user()`
+2. **Every protected route validates the token** — `auth_jwt.get_current_user()`
    reads the JWT from either the cookie or an `Authorization: Bearer <token>`
    header, verifies its signature and expiry, and extracts the username and
    role. Unauthenticated requests to the page redirect to `/login`;
    unauthenticated API calls get a plain `401 Not authenticated`.
-3. **Roles gate specific actions**, using a simple hierarchy where each role
-   includes everything below it:
-
-   | Role | Can do |
-   |---|---|
-   | `reader` | View the recorded files table |
-   | `writer` | Everything `reader` can, plus upload files and trigger a scan |
-   | `admin` | Everything `writer` can, plus delete a file's record |
-
-   A request past its role (e.g. a `reader` calling `POST /scan`) gets
-   `403 Forbidden`, naming the role actually required.
 
 **Where the secrets live:** both the JWT signing key and the user list
 (with PBKDF2-hashed passwords, never plaintext) are Key Vault secrets,
@@ -140,9 +144,83 @@ authorize by role) end to end. Before using anything like this for real,
 you'd want at least: rate limiting / account lockout on login attempts,
 refresh tokens and a revocation list (a leaked JWT is valid until it
 expires — there's no way to invalidate one early here), secret rotation for
-the JWT signing key, a real user-management story instead of a static list,
-and probably MFA. For anything beyond a training demo, an actual identity
-provider (Entra ID, etc.) is the better call.
+the JWT signing key, and a real user-management story instead of a static
+list. That's exactly what the other mode below gets you.
+
+### `AUTH_MODE=azuread` — Microsoft Entra ID (Azure-native)
+
+Switching `AUTH_MODE` to `"azuread"` replaces all of the above with
+**Azure Container Apps' built-in authentication** ("Easy Auth") backed by
+Microsoft Entra ID:
+
+- Sign-in, sign-out, and token validation (signature, issuer, audience,
+  expiry) all happen at the **platform level**, in front of the container —
+  this app never sees a raw token or handles a password.
+- Authorization still uses the same reader/writer/admin roles, but now
+  they're **Entra ID App Roles**, assigned to specific users (or groups) in
+  your tenant. `fastapi_app/auth_azuread.py` just reads the identity Azure
+  forwards in a request header (`X-MS-CLIENT-PRINCIPAL`) — see that file's
+  docstring for exactly how.
+- The client secret for the app registration is generated once, stored only
+  in Key Vault, and referenced by the Container App via a Key Vault
+  reference (`keyvaultref:...,identityref:...`) — never a raw value in an
+  env var.
+
+Setting this up requires registering an application in Entra ID first —
+see **[`docs/azure-ad-setup.md`](docs/azure-ad-setup.md)** for the full
+walkthrough and `scripts/setup_azure_ad.sh` for the automation. Short
+version: set `AUTH_MODE="azuread"` in `config.env`, optionally fill in
+`AAD_USER_ROLE_ASSIGNMENTS`, and run `./deploy.sh` — it detects there's no
+Entra ID app yet and registers one automatically once it knows the
+Container App's URL.
+
+Both auth modes are real, working code paths in the same container image
+(picked at runtime by `AUTH_MODE`) specifically so you can compare them
+side by side.
+
+### Diagrams
+
+- **`docs/diagrams/jwt-mode-architecture.svg`** — the `AUTH_MODE=jwt` flow:
+  browser to FastAPI directly, Key Vault holding the JWT secret and hashed
+  user list, then Cosmos DB / the file share.
+- **`docs/diagrams/azuread-mode-architecture.svg`** — the `AUTH_MODE=azuread`
+  flow: browser to Container Apps' built-in auth, which redirects to Entra
+  ID, validates the token using a Key Vault-held client secret, and only
+  then forwards an already-authenticated request to FastAPI with the
+  caller's identity in a header.
+- **`docs/diagrams/future-state-architecture.svg`** — see below.
+
+## Future state: a production-grade version of this
+
+Everything above is a working demo, not a production deployment. If this
+were headed to production, here's the shape it would take
+(`docs/diagrams/future-state-architecture.svg`) — none of this is built in
+this repo; it's a map of what enterprise standards would add on top:
+
+- **Edge & API** — Azure Front Door with WAF in front of everything (DDoS
+  protection, TLS termination, global routing), and an API Management
+  gateway in front of the app for rate limiting, request validation, and a
+  managed API surface instead of exposing the Container App directly.
+- **App runtime** — Container Apps with ingress set to internal-only,
+  reachable solely through the gateway above, all inside a VNet.
+- **Data** — Storage, Cosmos DB, and Key Vault reachable only via private
+  endpoints inside that same VNet — no public data-plane endpoints at all,
+  vs. this demo's public (but managed-identity/RBAC-gated) endpoints.
+- **Identity & governance** — `AUTH_MODE=azuread` as the baseline, plus
+  Conditional Access policies (block legacy auth, require compliant
+  devices, require MFA) and Privileged Identity Management for just-in-time
+  admin role activation instead of standing Admin app-role assignments.
+- **Observability** — Log Analytics + Application Insights for telemetry,
+  Microsoft Sentinel for SIEM/alerting on anomalous sign-ins or access
+  patterns, and Defender for Cloud for posture management across the whole
+  landing zone.
+- **CI/CD** — the manual `az acr build` / `deploy.sh` steps here become an
+  automated pipeline: build, container image scanning, IaC (Bicep/Terraform
+  instead of an imperative bash script), staged rollout, and automated
+  secret rotation for the Key Vault-held values.
+- Beyond the diagram: multi-region deployment with Cosmos DB's own
+  multi-region replication for resilience, and a real change-management
+  process instead of a single script an individual runs by hand.
 
 ## Prerequisites
 
@@ -265,15 +343,21 @@ charges.
 ## Project layout
 
 ```
-config.env                          deployment parameters (incl. demo user list)
-deploy.sh                           deploy / destroy script
+config.env                          deployment parameters (incl. demo user list, AUTH_MODE)
+deploy.sh                           deploy / destroy script (handles both auth modes)
+docs/azure-ad-setup.md              prerequisites for AUTH_MODE=azuread
+docs/diagrams/                      the three architecture diagrams referenced above
 function_app/                       Azure Function (timer trigger, Python v2 model)
 fastapi_app/                        FastAPI UI (Jinja2 templates) + scan/upload/delete endpoints
 fastapi_app/clients.py              shared Key Vault / file share / Cosmos client helpers
-fastapi_app/auth.py                 JWT auth + reader/writer/admin authorization
-fastapi_app/templates/login.html    sign-in page
+fastapi_app/roles.py                shared reader/writer/admin role hierarchy (both auth modes)
+fastapi_app/auth.py                 facade — picks auth_jwt.py or auth_azuread.py via AUTH_MODE
+fastapi_app/auth_jwt.py             AUTH_MODE=jwt backend: this app's own login/JWT issuance
+fastapi_app/auth_azuread.py         AUTH_MODE=azuread backend: reads Container Apps' Easy Auth header
+fastapi_app/templates/login.html    sign-in page (AUTH_MODE=jwt only)
 scripts/upload_to_fileshare.sh      upload local files to the file share
 scripts/simulate_local_ingestion.py fallback: writes metadata to Cosmos DB without the Function
-scripts/generate_users_secret.py    hashes DEMO_USERS for the Key Vault 'app-users' secret
+scripts/generate_users_secret.py    hashes DEMO_USERS for the Key Vault 'app-users' secret (AUTH_MODE=jwt)
+scripts/setup_azure_ad.sh           registers the Entra ID app + roles (AUTH_MODE=azuread)
 data/                               local scratch folder used by the scripts above
 ```
