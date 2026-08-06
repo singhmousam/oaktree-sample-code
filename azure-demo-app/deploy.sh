@@ -435,6 +435,6 @@ create_cosmos
 create_keyvault
 assign_roles
 build_images
-deploy_function
+# deploy_function
 deploy_fastapi
 print_summary
