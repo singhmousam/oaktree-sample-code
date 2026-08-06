@@ -1,0 +1,9 @@
+This is a sample file for the Azure file-upload demo.
+
+Use this directory to hold files you want to:
+  - upload to the Azure File Share with scripts/upload_to_fileshare.sh, or
+  - "process" locally with scripts/simulate_local_ingestion.py as a stand-in
+    for the Azure Function, if the Function isn't working yet.
+
+Add or remove files here freely -- both scripts pick up whatever is directly
+inside this folder.

@@ -4,8 +4,7 @@ A small end-to-end demo: drop a file into an Azure Files share, a Function
 picks up its metadata and writes it to Cosmos DB, and a FastAPI app shows it
 in a browser. Every service talks to the others using **managed identity** —
 there are no connection strings, SAS tokens, or account keys anywhere in the
-deployed configuration. 
-Custom Message
+deployed configuration.
 
 ## Architecture
 
@@ -58,9 +57,31 @@ code to that if you want it instead.
 | Azure Container Registry (ACR) | Builds & hosts both app images |
 | 2x User-Assigned Managed Identity | One for the Function, one for the FastAPI app |
 | Storage Account + File Share | Where files are uploaded |
+| Key Vault | Holds the storage account key the FastAPI app uses for its own share access |
 | Cosmos DB (Table API) | Stores file metadata |
 | Function App (Elastic Premium, Linux, container) | Scans the share, writes metadata |
 | Container Apps environment + Container App | Hosts the FastAPI UI |
+
+## FastAPI app features
+
+- **View recorded files** — the main table, sourced from Cosmos DB (as before).
+- **Scan file share now** — a button that lists everything currently in the
+  file share and upserts metadata for each file into Cosmos DB immediately,
+  instead of waiting for the Function's next timer run.
+- **Upload from the browser** — a form that uploads a file straight to the
+  file share and records its metadata right away.
+
+Every record shows a `Source` column (`azure-function`, `fastapi-scan`, or
+`fastapi-upload`) so you can see which path produced it.
+
+**Auth model for these two features specifically:** the FastAPI app talks to
+Cosmos DB using its managed identity directly (OAuth), same as before. For
+the file share, it instead reads the storage account key out of **Key
+Vault** and uses that key — access to Key Vault itself is still via managed
+identity (`Key Vault Secrets User` role, read-only), so the only secret
+value anywhere in the whole stack is that one key, and only the FastAPI
+identity can read it. The Function App is unaffected — it still talks to the
+file share with pure OAuth (no key), as before.
 
 ## Prerequisites
 
@@ -74,12 +95,6 @@ code to that if you want it instead.
 
 Edit `config.env` — every value has a comment explaining it. At minimum you
 may want to change `PREFIX` and `LOCATION`.
-## Setup AZ CLI
-Download and install AZ CLI from https://learn.microsoft.com/en-us/cli/azure/install-azure-cli-windows?view=azure-cli-latest&pivots=msi
-
-Run ```az login```
-And choose default Sub ID, press Enter to continue
-Move to coresponding directory, ```cd ./azure-demo-app``` and run the deploy.sh file
 
 ## Deploy
 
@@ -94,8 +109,11 @@ of creating duplicates.
 The script takes roughly 10–15 minutes, mostly waiting on the Cosmos DB
 account and the Elastic Premium plan to provision.
 
-At the end it prints the FastAPI app's public URL and a sample upload
-command, e.g.:
+At the end it prints the FastAPI app's public URL. From there you can just
+open the app and use the "Upload to file share" form or the "Scan file
+share now" button directly in the browser — no CLI needed.
+
+If you'd rather upload via CLI and let the Function's timer pick it up:
 
 ```bash
 az storage file upload \
@@ -115,6 +133,7 @@ Wait for the next timer run (up to ~2 minutes), then refresh the app URL.
 
 Deletes the whole resource group (background operation) and clears the
 local state file.
+
 ## Helper scripts
 
 Two standalone scripts under `scripts/` are useful for testing and as a
@@ -180,8 +199,12 @@ charges.
 ## Project layout
 
 ```
-config.env             deployment parameters
-deploy.sh               deploy / destroy script
-function_app/           Azure Function (timer trigger, Python v2 model)
-fastapi_app/            FastAPI UI (Jinja2 template)
+config.env                          deployment parameters
+deploy.sh                           deploy / destroy script
+function_app/                       Azure Function (timer trigger, Python v2 model)
+fastapi_app/                        FastAPI UI (Jinja2 template) + scan/upload endpoints
+fastapi_app/clients.py              shared Key Vault / file share / Cosmos client helpers
+scripts/upload_to_fileshare.sh      upload local files to the file share
+scripts/simulate_local_ingestion.py fallback: writes metadata to Cosmos DB without the Function
+data/                               local scratch folder used by both scripts above
 ```
